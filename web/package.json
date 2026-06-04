@@ -32,14 +32,14 @@
     "framer-motion": "12.38.0",
     "katex": "0.16.45",
     "lucide-react": "0.544.0",
-    "mermaid": "11.14.0",
+    "mermaid": "11.15.0",
     "nanoid": "5.1.7",
-    "next": "16.2.3",
+    "next": "16.2.6",
     "next-themes": "0.4.6",
     "react": "19.2.1",
     "react-day-picker": "9.14.0",
     "react-dom": "19.2.1",
-    "react-force-graph-2d": "^1.29.1",
+    "react-force-graph-2d": "1.29.1",
     "react-markdown": "10.1.0",
     "react-pdf": "10.4.1",
     "react-resizable-panels": "4.9.0",
@@ -55,7 +55,9 @@
   },
   "overrides": {
     "postcss": "8.5.10",
-    "uuid": ">=14.0.0"
+    "uuid": "14.0.0",
+    "fast-uri": "3.1.2",
+    "ws": "8.21.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.2.2",

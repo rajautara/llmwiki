@@ -16,6 +16,9 @@ from pathlib import Path
 import aiosqlite
 
 from config import settings
+from domain.watcher import mark_written
+from infra.db.sqlite import SQLiteDocumentRepository
+from services.extracted_assets import build_pdf_image_assets
 
 logger = logging.getLogger(__name__)
 
@@ -98,27 +101,78 @@ async def _store_chunks(db: aiosqlite.Connection, doc_id: str, chunks: list) -> 
     await db.execute("DELETE FROM document_chunks WHERE document_id = ?", (doc_id,))
     for c in chunks:
         await db.execute(
-            "INSERT INTO document_chunks (id, document_id, chunk_index, content, page, "
-            "start_char, token_count, header_breadcrumb) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (str(uuid.uuid4()), doc_id, c.index, c.content, c.page,
+            "INSERT INTO document_chunks (id, document_id, chunk_index, content, source_content, page, "
+            "start_char, token_count, header_breadcrumb) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), doc_id, c.index, c.content, c.content, c.page,
              c.start_char, c.token_count, c.header_breadcrumb),
         )
 
 
 # ── PDF extraction ────────────────────────────────────────────────────────
 
+async def _save_local_images(
+    db: aiosqlite.Connection, doc_id: str, workspace: Path,
+    pages_with_images: list[tuple[int, str, list[dict]]],
+) -> dict[int, dict]:
+    """Save extracted images as hidden sibling assets and return page metadata."""
+    repo = SQLiteDocumentRepository(db)
+    doc = await repo.get(doc_id)
+    if not doc:
+        return {}
+
+    assets, page_elements = build_pdf_image_assets(
+        doc_id,
+        doc["filename"],
+        doc["path"],
+        pages_with_images,
+    )
+    if not assets:
+        return {}
+
+    await db.execute(
+        "DELETE FROM documents WHERE source_kind = 'asset' AND metadata LIKE ?",
+        (f'%"parent_document_id": "{doc_id}"%',),
+    )
+    await db.commit()
+
+    asset_metadata = []
+    for asset in assets:
+        relative_asset = (asset.path.rstrip("/") + "/" + asset.filename).lstrip("/")
+        local_asset = workspace / relative_asset
+        local_asset.parent.mkdir(parents=True, exist_ok=True)
+        mark_written(str(local_asset))
+        local_asset.write_bytes(asset.data)
+        await repo.create_asset(
+            asset.document_id,
+            doc["user_id"],
+            asset.filename,
+            asset.path,
+            asset.filename,
+            asset.file_type,
+            len(asset.data),
+            asset.metadata(),
+        )
+        asset_metadata.append(asset.metadata())
+
+    await repo.set_metadata_field(doc_id, "assets", asset_metadata)
+    return page_elements
+
+
 async def _store_page_contents(
     db: aiosqlite.Connection, doc_id: str,
     page_contents: list[tuple[int, str]], parser: str,
+    page_elements: dict[int, dict] | None = None,
 ) -> None:
     """Store extracted pages, chunks, and update document status."""
     num_pages = len(page_contents)
 
     await db.execute("DELETE FROM document_pages WHERE document_id = ?", (doc_id,))
     for page_num, content in page_contents:
+        elements = (page_elements or {}).get(page_num)
         await db.execute(
-            "INSERT INTO document_pages (id, document_id, page, content) VALUES (?, ?, ?, ?)",
-            (str(uuid.uuid4()), doc_id, page_num, content),
+            "INSERT INTO document_pages (id, document_id, page, content, elements) VALUES (?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), doc_id, page_num, content,
+             json.dumps(elements) if elements else None),
         )
 
     full_content = "\n\n---\n\n".join(md for _, md in page_contents)
@@ -140,8 +194,10 @@ async def _process_pdf(db: aiosqlite.Connection, doc_id: str, file_path: Path, w
     if settings.PDF_BACKEND == "mistral" and settings.MISTRAL_API_KEY:
         await _process_pdf_mistral(db, doc_id, file_path, workspace)
     else:
-        page_contents = await asyncio.to_thread(extract_pdf, str(file_path))
-        await _store_page_contents(db, doc_id, page_contents, "opendataloader")
+        pages_with_images = await asyncio.to_thread(extract_pdf, str(file_path))
+        page_elements = await _save_local_images(db, doc_id, workspace, pages_with_images)
+        page_contents = [(num, md) for num, md, _ in pages_with_images]
+        await _store_page_contents(db, doc_id, page_contents, "opendataloader", page_elements)
 
 
 # ── Office processing ─────────────────────────────────────────────────────
@@ -179,8 +235,10 @@ async def _process_office(db: aiosqlite.Connection, doc_id: str, file_path: Path
         cache_dir.mkdir(parents=True, exist_ok=True)
         shutil.copy2(converted_pdf, cache_dir / "converted.pdf")
 
-        page_contents = await asyncio.to_thread(extract_pdf, str(converted_pdf))
-        await _store_page_contents(db, doc_id, page_contents, "libreoffice+opendataloader")
+        pages_with_images = await asyncio.to_thread(extract_pdf, str(converted_pdf))
+        page_elements = await _save_local_images(db, doc_id, workspace, pages_with_images)
+        page_contents = [(num, md) for num, md, _ in pages_with_images]
+        await _store_page_contents(db, doc_id, page_contents, "libreoffice+opendataloader", page_elements)
 
 
 # ── Mistral OCR ───────────────────────────────────────────────────────────

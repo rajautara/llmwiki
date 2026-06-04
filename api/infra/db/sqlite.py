@@ -50,7 +50,7 @@ async def create_pool(db_path: str) -> aiosqlite.Connection:
     db.row_factory = None
     await db.execute("PRAGMA journal_mode=WAL")
     await db.execute("PRAGMA foreign_keys=ON")
-    schema = _SCHEMA_PATH.read_text()
+    schema = _SCHEMA_PATH.read_text(encoding='utf-8')
     await db.executescript(schema)
     await db.commit()
     return db
@@ -196,6 +196,273 @@ class SQLiteDocumentRepository:
         row = await cursor.fetchone()
         return row[0] if row else None
 
+    async def get_by_source_url(self, url: str) -> dict | None:
+        cursor = await self._db.execute(
+            "SELECT id, knowledge_base_id, title, path, filename, version, highlights "
+            "FROM documents "
+            "WHERE status != 'failed' "
+            "AND json_extract(metadata, '$.source_url') = ? "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (url,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        result = _row_to_dict(cursor, row)
+        result["highlights"] = self._parse_highlights(result.get("highlights"))
+        return result
+
+    async def get_highlights(self, doc_id: str) -> dict | None:
+        cursor = await self._db.execute(
+            "SELECT id, version, highlights FROM documents WHERE id = ?", (doc_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return None
+        result = _row_to_dict(cursor, row)
+        result["highlights"] = self._parse_highlights(result.get("highlights"))
+        return result
+
+    async def replace_highlights(
+        self, doc_id: str, user_id: str, highlights: list[dict],
+        expected_version: int | None = None,
+    ) -> dict | None:
+        # BEGIN IMMEDIATE grabs a RESERVED lock up front so concurrent
+        # writers wait instead of stale-reading the highlights JSON below.
+        # Without this, two interleaved upserts could clobber each other.
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            check = await self._db.execute(
+                "SELECT version, highlights FROM documents WHERE id = ?", (doc_id,),
+            )
+            existing = await check.fetchone()
+            if not existing:
+                await self._db.rollback()
+                return None
+            if expected_version is not None and existing[0] != expected_version:
+                await self._db.rollback()
+                return {"conflict": True}
+            old_highlights = self._parse_highlights(existing[1])
+
+            payload = json.dumps(highlights)
+            cursor = await self._db.execute(
+                "UPDATE documents SET highlights = ?, "
+                "version = version + 1, updated_at = datetime('now') "
+                "WHERE id = ? "
+                "RETURNING id, version, highlights",
+                (payload, doc_id),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                await self._db.rollback()
+                return None
+            result = _row_to_dict(cursor, row)
+            new_highlights = self._parse_highlights(result.get("highlights"))
+            result["highlights"] = new_highlights
+            await self._recompute_chunks_for_doc(doc_id, old_highlights, new_highlights)
+            await self._db.commit()
+            return result
+        except Exception:
+            try:
+                await self._db.rollback()
+            except Exception:
+                pass
+            raise
+
+    async def upsert_highlight(
+        self, doc_id: str, user_id: str, highlight: dict,
+        expected_version: int | None = None,
+    ) -> dict | None:
+        """Atomic single-entry upsert by id."""
+        new_id = highlight.get("id")
+        if not new_id:
+            return None
+
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await self._db.execute(
+                "SELECT version, highlights FROM documents WHERE id = ?", (doc_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                await self._db.rollback()
+                return None
+            version, highlights_raw = row[0], row[1]
+            if expected_version is not None and version != expected_version:
+                await self._db.rollback()
+                return {"conflict": True}
+
+            current = self._parse_highlights(highlights_raw)
+            replaced = False
+            next_list: list[dict] = []
+            for h in current:
+                if isinstance(h, dict) and h.get("id") == new_id:
+                    next_list.append(highlight)
+                    replaced = True
+                else:
+                    next_list.append(h)
+            if not replaced:
+                if len(current) >= 500:
+                    await self._db.rollback()
+                    return {"limit_exceeded": True}
+                next_list.append(highlight)
+
+            payload = json.dumps(next_list)
+            cursor = await self._db.execute(
+                "UPDATE documents SET highlights = ?, "
+                "version = version + 1, updated_at = datetime('now') "
+                "WHERE id = ? "
+                "RETURNING id, version, highlights",
+                (payload, doc_id),
+            )
+            result_row = await cursor.fetchone()
+            if not result_row:
+                await self._db.rollback()
+                return None
+            result = _row_to_dict(cursor, result_row)
+            new_highlights = self._parse_highlights(result.get("highlights"))
+            result["highlights"] = new_highlights
+            await self._recompute_chunks_for_doc(doc_id, current, new_highlights)
+            await self._db.commit()
+            return result
+        except Exception:
+            try:
+                await self._db.rollback()
+            except Exception:
+                pass
+            raise
+
+    async def delete_highlight(
+        self, doc_id: str, user_id: str, highlight_id: str,
+        expected_version: int | None = None,
+    ) -> dict | None:
+        await self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await self._db.execute(
+                "SELECT version, highlights FROM documents WHERE id = ?", (doc_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                await self._db.rollback()
+                return None
+            version, highlights_raw = row[0], row[1]
+            if expected_version is not None and version != expected_version:
+                await self._db.rollback()
+                return {"conflict": True}
+
+            current = self._parse_highlights(highlights_raw)
+            next_list = [
+                h for h in current
+                if not (isinstance(h, dict) and h.get("id") == highlight_id)
+            ]
+            if len(next_list) == len(current):
+                # Idempotent no-op: nothing to write, release the lock cleanly.
+                await self._db.rollback()
+                return {"id": doc_id, "version": version, "highlights": current}
+
+            payload = json.dumps(next_list)
+            cursor = await self._db.execute(
+                "UPDATE documents SET highlights = ?, "
+                "version = version + 1, updated_at = datetime('now') "
+                "WHERE id = ? "
+                "RETURNING id, version, highlights",
+                (payload, doc_id),
+            )
+            result_row = await cursor.fetchone()
+            if not result_row:
+                await self._db.rollback()
+                return None
+            result = _row_to_dict(cursor, result_row)
+            new_highlights = self._parse_highlights(result.get("highlights"))
+            result["highlights"] = new_highlights
+            await self._recompute_chunks_for_doc(doc_id, current, new_highlights)
+            await self._db.commit()
+            return result
+        except Exception:
+            try:
+                await self._db.rollback()
+            except Exception:
+                pass
+            raise
+
+    async def _recompute_chunks_for_doc(
+        self, doc_id: str,
+        old_highlights: list[dict], new_highlights: list[dict],
+    ) -> None:
+        """Update affected chunks' annotations_text + has_highlight + content
+        in the same implicit txn as the highlights write.
+
+        Affected = (chunks touched by old) ∪ (chunks touched by new). The
+        union covers the deletion case where a highlight's prior chunk would
+        otherwise keep its stale annotation.
+        """
+        from services.highlight_chunks import (
+            ChunkRecord, all_affected_chunks, iter_chunks_with_annotations,
+        )
+
+        cursor = await self._db.execute(
+            "SELECT id, chunk_index, source_content, page, start_char "
+            "FROM document_chunks WHERE document_id = ? "
+            "ORDER BY chunk_index",
+            (doc_id,),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return
+        chunks = [
+            ChunkRecord(
+                id=r[0], chunk_index=r[1],
+                source_content=r[2] or "",
+                page=r[3], start_char=r[4],
+            )
+            for r in rows
+        ]
+        affected = all_affected_chunks(chunks, old_highlights, new_highlights)
+        if not affected:
+            return
+
+        for chunk, anno_text, has_hl, new_content in iter_chunks_with_annotations(
+            chunks, affected, new_highlights,
+        ):
+            await self._db.execute(
+                "UPDATE document_chunks "
+                "SET annotations_text = ?, has_highlight = ?, content = ? "
+                "WHERE id = ?",
+                (anno_text, 1 if has_hl else 0, new_content, chunk.id),
+            )
+
+    async def set_metadata_field(self, doc_id: str, key: str, value) -> None:
+        cursor = await self._db.execute(
+            "SELECT metadata FROM documents WHERE id = ?", (doc_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return
+        meta = {}
+        if row[0]:
+            try:
+                meta = json.loads(row[0]) or {}
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+        meta[key] = value
+        await self._db.execute(
+            "UPDATE documents SET metadata = ?, updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(meta), doc_id),
+        )
+        await self._db.commit()
+
+    @staticmethod
+    def _parse_highlights(value):
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+
     async def update_status(self, doc_id: str, status: str, **fields) -> None:
         updates = ["status = ?"]
         params = [status]
@@ -242,6 +509,28 @@ class SQLiteDocumentRepository:
         )
         await self._db.commit()
 
+    async def create_asset(
+        self, doc_id: str, user_id: str, filename: str, path: str,
+        title: str, file_type: str, file_size: int, metadata: dict,
+    ) -> dict | None:
+        relative_path = (path.rstrip("/") + "/" + filename).lstrip("/")
+
+        cursor = await self._db.execute(
+            "SELECT COALESCE(MAX(document_number), 0) + 1 FROM documents",
+        )
+        row = await cursor.fetchone()
+        doc_number = row[0]
+
+        await self._db.execute(
+            "INSERT INTO documents (id, user_id, filename, title, path, relative_path, source_kind, "
+            "file_type, file_size, status, content, tags, version, document_number, metadata) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'asset', ?, ?, 'ready', NULL, '[]', 0, ?, ?)",
+            (doc_id, user_id, filename, title, path, relative_path, file_type,
+             file_size, doc_number, json.dumps(metadata)),
+        )
+        await self._db.commit()
+        return await self.get(doc_id)
+
 
 class SQLiteKBRepository:
     """Singleton KB compatibility layer. One workspace = one KB."""
@@ -253,7 +542,7 @@ class SQLiteKBRepository:
         cursor = await self._db.execute(
             "SELECT w.id, w.user_id, w.name, w.name as slug, w.description, "
             "w.created_at, w.created_at as updated_at, "
-            "(SELECT count(*) FROM documents WHERE source_kind != 'wiki' AND status != 'failed') as source_count, "
+            "(SELECT count(*) FROM documents WHERE source_kind = 'source' AND status != 'failed') as source_count, "
             "(SELECT count(*) FROM documents WHERE source_kind = 'wiki' AND status != 'failed') as wiki_page_count "
             "FROM workspace w",
         )
@@ -264,7 +553,7 @@ class SQLiteKBRepository:
         cursor = await self._db.execute(
             "SELECT w.id, w.user_id, w.name, w.name as slug, w.description, "
             "w.created_at, w.created_at as updated_at, "
-            "(SELECT count(*) FROM documents WHERE source_kind != 'wiki' AND status != 'failed') as source_count, "
+            "(SELECT count(*) FROM documents WHERE source_kind = 'source' AND status != 'failed') as source_count, "
             "(SELECT count(*) FROM documents WHERE source_kind = 'wiki' AND status != 'failed') as wiki_page_count "
             "FROM workspace w WHERE w.id = ?",
             (kb_id,),
@@ -328,12 +617,15 @@ class SQLiteChunkRepository:
             await self._db.commit()
             return
 
+        # source_content seeds the immutable raw text; content starts
+        # identical and only diverges if highlight CRUD writes annotations
+        # into the chunk later. See api/services/highlight_chunks.
         await self._db.executemany(
             "INSERT INTO document_chunks "
-            "(id, document_id, chunk_index, content, page, start_char, token_count, header_breadcrumb) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "(id, document_id, chunk_index, content, source_content, page, start_char, token_count, header_breadcrumb) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                (str(uuid.uuid4()), doc_id, c.index, c.content, c.page,
+                (str(uuid.uuid4()), doc_id, c.index, c.content, c.content, c.page,
                  c.start_char, c.token_count, c.header_breadcrumb)
                 for c in chunks
             ],

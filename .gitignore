@@ -8,6 +8,8 @@ venv/
 
 # Build
 .next/
+.wxt/
+.output/
 dist/
 *.egg-info/
 
@@ -46,3 +48,12 @@ nvidia-10k-first20.md
 .claude
 .playwright-mcp
 .pytest_cache
+
+# Supabase CLI cache
+supabase/.temp/
+
+# Local-only specs / scratch docs
+docs/
+
+# Local-only developer scripts (apply_migration.sh, one-shot utilities)
+scripts/

@@ -1,19 +1,20 @@
-"""Write tool — create, edit, and append wiki pages and notes."""
+"""Write tools — create, edit, and append wiki pages and notes."""
 
 import re
 import yaml
 from datetime import date
-from typing import Literal
 
 from mcp.server.fastmcp import FastMCP, Context
 
 from vaultfs import VaultFS
+from vaultfs.base import DuplicateDocumentError
 from .helpers import deep_link, resolve_path
 from .references import update_references
 
 _ASSET_EXTENSIONS = {".svg", ".csv", ".json", ".xml", ".html"}
 _FILE_EXT_RE = re.compile(r"\.(md|txt|svg|csv|json|xml|html)$", re.IGNORECASE)
 _FRONTMATTER_RE = re.compile(r"\A---[ \t]*\n(.+?\n)---[ \t]*\n", re.DOTALL)
+_FOOTNOTE_DEF_RE = re.compile(r"^\[\^([^\]]+)\]:", re.MULTILINE)
 _CONTEXT_LINES = 5
 
 
@@ -47,6 +48,101 @@ def _extract_metadata(meta: dict) -> tuple[str | None, dict]:
     return date_str, metadata
 
 
+def _extract_frontmatter_tags(meta: dict) -> list[str] | None:
+    """Return normalized frontmatter tags, or None when frontmatter has no tags."""
+    if "tags" not in meta:
+        return None
+    raw_tags = meta.get("tags")
+    if isinstance(raw_tags, list):
+        return [str(t).strip() for t in raw_tags if str(t).strip()]
+    if isinstance(raw_tags, str):
+        return [t.strip() for t in raw_tags.split(",") if t.strip()]
+    return []
+
+
+def _effective_tags(content: str, provided: list[str] | None) -> list[str] | None:
+    """Use frontmatter tags as canonical when present; otherwise fallback."""
+    fm_tags = _extract_frontmatter_tags(_parse_frontmatter(content))
+    if fm_tags is not None:
+        return fm_tags
+    return provided
+
+
+def _effective_date(content: str, provided: str | None = None) -> str | None:
+    """Use frontmatter date as canonical when present; otherwise fallback."""
+    fm_date, _ = _extract_metadata(_parse_frontmatter(content))
+    return fm_date or provided or None
+
+
+def _is_footnote_suffix_line(line: str) -> bool:
+    return line.strip() == "" or line.startswith((" ", "\t")) or bool(_FOOTNOTE_DEF_RE.match(line))
+
+
+def _split_trailing_footnotes(content: str) -> tuple[str, str]:
+    """Split a markdown document into body and final footnote-definition block.
+
+    Footnote definitions conventionally live at EOF. Appending new sections
+    after them strands citations mid-document, so append inserts before the
+    final definition block when one exists.
+    """
+    stripped = content.rstrip()
+    if not stripped:
+        return "", ""
+
+    lines = stripped.splitlines()
+    for idx, line in enumerate(lines):
+        if _FOOTNOTE_DEF_RE.match(line) and all(
+            _is_footnote_suffix_line(suffix_line)
+            for suffix_line in lines[idx:]
+        ):
+            return "\n".join(lines[:idx]).rstrip(), "\n".join(lines[idx:]).rstrip()
+    return stripped, ""
+
+
+def _append_markdown_section(existing: str, addition: str) -> str:
+    """Append markdown while keeping trailing footnote definitions at EOF."""
+    addition = _renumber_colliding_footnotes(existing, addition.strip("\n"))
+    body, footnotes = _split_trailing_footnotes(existing)
+    parts = [part for part in (body, addition, footnotes) if part]
+    return "\n\n".join(parts)
+
+
+def _renumber_colliding_footnotes(existing: str, addition: str) -> str:
+    """Avoid duplicate page-local footnote ids when appending markdown."""
+    existing_ids = set(_FOOTNOTE_DEF_RE.findall(existing))
+    incoming_ids = _FOOTNOTE_DEF_RE.findall(addition)
+    if not existing_ids or not incoming_ids:
+        return addition
+
+    numeric_ids = [
+        int(i)
+        for i in existing_ids.union(incoming_ids)
+        if i.isdigit()
+    ]
+    next_id = max(numeric_ids, default=0) + 1
+    used = set(existing_ids)
+    replacements: dict[str, str] = {}
+
+    for footnote_id in incoming_ids:
+        if footnote_id not in used:
+            used.add(footnote_id)
+            continue
+        while str(next_id) in used:
+            next_id += 1
+        replacement = str(next_id)
+        replacements[footnote_id] = replacement
+        used.add(replacement)
+        next_id += 1
+
+    for old, new in replacements.items():
+        addition = re.sub(
+            rf"\[\^{re.escape(old)}\]",
+            f"[^{new}]",
+            addition,
+        )
+    return addition
+
+
 class WriteHandler:
     """Executes create, edit, and append operations on documents."""
 
@@ -59,7 +155,9 @@ class WriteHandler:
         """Create a new document or overwrite an existing one."""
         if not title:
             return "Error: title is required when creating a note."
-        if not tags:
+
+        effective_tags = _effective_tags(content, tags) or []
+        if not effective_tags:
             return "Error: at least one tag is required when creating a note."
 
         dir_path = self._to_dir_path(path)
@@ -71,7 +169,7 @@ class WriteHandler:
         if existing and not overwrite:
             return (
                 f"Error: `{dir_path}{filename}` already exists. "
-                f"Use `command=\"str_replace\"` to edit it, or pass `overwrite=true` to replace it entirely."
+                f"Use the `edit` tool to modify it, or pass `overwrite=true` to replace it entirely."
             )
 
         if not self.fs.write_to_disk(dir_path, filename, content):
@@ -80,20 +178,51 @@ class WriteHandler:
         # Extract date + description from frontmatter
         meta = _parse_frontmatter(content)
         fm_date, fm_metadata = _extract_metadata(meta)
+        saved_date = _effective_date(content, date_str)
 
         if existing:
-            await self.fs.update_document(str(existing["id"]), content, tags, title=title, date=fm_date, metadata=fm_metadata)
+            await self.fs.update_document(
+                str(existing["id"]),
+                content,
+                effective_tags,
+                title=title,
+                date=saved_date,
+                metadata=fm_metadata,
+            )
             doc = existing
         else:
-            doc = await self.fs.create_document(self.kb_id, filename, title, dir_path, file_type, content, tags, date=fm_date, metadata=fm_metadata)
+            try:
+                doc = await self.fs.create_document(
+                    self.kb_id,
+                    filename,
+                    title,
+                    dir_path,
+                    file_type,
+                    content,
+                    effective_tags,
+                    date=saved_date,
+                    metadata=fm_metadata,
+                )
+            except DuplicateDocumentError:
+                return (
+                    f"Error: `{dir_path}{filename}` already exists. "
+                    f"Use the `edit` tool to modify it, or pass `overwrite=true` to replace it entirely."
+                )
 
         doc_id = str(doc["id"])
         await self._sync_references(doc_id, content, dir_path, file_type)
 
         impact = await self._get_wiki_impact(doc_id, dir_path)
-        return self._format_create_response(title, tags, dir_path, filename, file_type, date_str) + impact
+        return self._format_create_response(
+            title,
+            effective_tags,
+            dir_path,
+            filename,
+            file_type,
+            saved_date,
+        ) + impact
 
-    async def edit(self, path: str, old_text: str, new_text: str, tags: list[str] | None) -> str:
+    async def edit(self, path: str, old_text: str, new_text: str) -> str:
         """Replace exact text in an existing document."""
         if not old_text:
             return "Error: old_text is required for str_replace."
@@ -114,7 +243,13 @@ class WriteHandler:
         self.fs.write_to_disk(dir_path, filename, new_content)
         meta = _parse_frontmatter(new_content)
         fm_date, fm_metadata = _extract_metadata(meta)
-        await self.fs.update_document(str(doc["id"]), new_content, tags, date=fm_date, metadata=fm_metadata)
+        await self.fs.update_document(
+            str(doc["id"]),
+            new_content,
+            _effective_tags(new_content, None),
+            date=fm_date,
+            metadata=fm_metadata,
+        )
 
         doc_id = str(doc["id"])
         await self._sync_references(doc_id, new_content, dir_path)
@@ -123,19 +258,25 @@ class WriteHandler:
         impact = await self._get_wiki_impact(doc_id, dir_path)
         return self._format_edit_response(path, dir_path, filename, snippet) + impact
 
-    async def append(self, path: str, content: str, tags: list[str] | None) -> str:
+    async def append(self, path: str, content: str) -> str:
         """Append content to the end of an existing document."""
         dir_path, filename = resolve_path(path)
         doc = await self.fs.get_document(self.kb_id, filename, dir_path)
         if not doc:
             return f"Document '{path}' not found."
 
-        new_content = (doc.get("content") or "") + "\n\n" + content
+        new_content = _append_markdown_section(doc.get("content") or "", content)
 
         self.fs.write_to_disk(dir_path, filename, new_content)
         meta = _parse_frontmatter(new_content)
         fm_date, fm_metadata = _extract_metadata(meta)
-        await self.fs.update_document(str(doc["id"]), new_content, tags, date=fm_date, metadata=fm_metadata)
+        await self.fs.update_document(
+            str(doc["id"]),
+            new_content,
+            _effective_tags(new_content, None),
+            date=fm_date,
+            metadata=fm_metadata,
+        )
 
         doc_id = str(doc["id"])
         await self._sync_references(doc_id, new_content, dir_path)
@@ -206,7 +347,7 @@ class WriteHandler:
             return f"Error: found {count} matches for old_text. Provide more context to match exactly once."
         return None
 
-    def _format_create_response(self, title: str, tags: list[str], dir_path: str, filename: str, file_type: str, date_str: str) -> str:
+    def _format_create_response(self, title: str, tags: list[str], dir_path: str, filename: str, file_type: str, date_str: str | None) -> str:
         """Build the response message for a create operation."""
         link = deep_link(self.kb["slug"], dir_path, filename)
         note_date = date_str or date.today().isoformat()
@@ -261,48 +402,77 @@ class WriteHandler:
 
 def register(mcp: FastMCP, get_user_id, fs_factory) -> None:
 
-    @mcp.tool(
-        name="write",
-        description=(
-            "Create or edit notes and wiki pages in the knowledge vault.\n\n"
-            "Wiki pages should be created under `/wiki/` and should cite their sources using "
-            "markdown footnotes (e.g. `[^1]: paper.pdf, p.3`).\n\n"
-            "You can also create SVG diagrams and CSV data files as wiki assets:\n"
-            "- `write(command=\"create\", path=\"/wiki/\", title=\"architecture-diagram.svg\", content=\"<svg>...</svg>\", tags=[\"diagram\"])`\n"
-            "- `write(command=\"create\", path=\"/wiki/\", title=\"data-table.csv\", content=\"col1,col2\\nval1,val2\", tags=[\"data\"])`\n"
-            "SVGs and other assets can be embedded in wiki pages via `![Architecture](architecture-diagram.svg)`\n\n"
-            "Commands:\n"
-            "- create: create a new page (title and tags are REQUIRED). Rejects if page already exists — use overwrite=true to replace.\n"
-            "- str_replace: replace exact text in an existing page (read first)\n"
-            "- append: add content to the end of an existing page"
-        ),
-    )
-    async def write(
-        ctx: Context,
-        knowledge_base: str,
-        command: Literal["create", "str_replace", "append"],
-        path: str = "/",
-        title: str = "",
-        content: str = "",
-        tags: list[str] | None = None,
-        date_str: str = "",
-        old_text: str = "",
-        new_text: str = "",
-        overwrite: bool = False,
-    ) -> str:
+    async def _resolve(ctx: Context, knowledge_base: str):
         user_id = get_user_id(ctx)
         fs = fs_factory(user_id)
         kb = await fs.resolve_kb(knowledge_base)
-        if not kb:
-            return f"Knowledge base '{knowledge_base}' not found."
+        return (WriteHandler(fs, kb), None) if kb else (None, f"Knowledge base '{knowledge_base}' not found.")
 
-        handler = WriteHandler(fs, kb)
+    @mcp.tool(
+        name="create",
+        description=(
+            "Create a new wiki page, note, or asset in the knowledge vault.\n\n"
+            "Wiki pages should be created under `/wiki/` and should cite their sources using "
+            "markdown footnotes (e.g. `[^1]: paper.pdf, p.3`).\n\n"
+            "You can also create SVG diagrams and CSV data files as wiki assets:\n"
+            "- `create(path=\"/wiki/\", title=\"architecture-diagram.svg\", content=\"<svg>...</svg>\", tags=[\"diagram\"])`\n"
+            "- `create(path=\"/wiki/\", title=\"data-table.csv\", content=\"col1,col2\\nval1,val2\", tags=[\"data\"])`\n"
+            "SVGs and other assets can be embedded in wiki pages via `![Architecture](architecture-diagram.svg)`\n\n"
+            "Rejects if the page already exists — use `overwrite=true` to replace, or use the `edit` tool to modify."
+        ),
+    )
+    async def create(
+        ctx: Context,
+        knowledge_base: str,
+        title: str,
+        content: str,
+        tags: list[str],
+        path: str = "/wiki/",
+        date_str: str = "",
+        overwrite: bool = False,
+    ) -> str:
+        handler, err = await _resolve(ctx, knowledge_base)
+        if err:
+            return err
+        return await handler.create(path, title, content, tags, date_str, overwrite)
 
-        if command == "create":
-            return await handler.create(path, title, content, tags or [], date_str, overwrite)
-        elif command == "str_replace":
-            return await handler.edit(path, old_text, new_text, tags)
-        elif command == "append":
-            return await handler.append(path, content, tags)
+    @mcp.tool(
+        name="edit",
+        description=(
+            "Replace exact text in an existing wiki page or note.\n\n"
+            "Works like find-and-replace: provide the exact text to find (`old_text`) and "
+            "the replacement (`new_text`). The match must be unique — if multiple matches are "
+            "found, provide more surrounding context to disambiguate.\n\n"
+            "Read the page first to see its current content before editing."
+        ),
+    )
+    async def edit(
+        ctx: Context,
+        knowledge_base: str,
+        path: str,
+        old_text: str,
+        new_text: str,
+    ) -> str:
+        handler, err = await _resolve(ctx, knowledge_base)
+        if err:
+            return err
+        return await handler.edit(path, old_text, new_text)
 
-        return f"Unknown command: {command}"
+    @mcp.tool(
+        name="append",
+        description=(
+            "Append content to the end of an existing wiki page or note.\n\n"
+            "Useful for adding new sections, log entries, or additional findings "
+            "to a page without reading and rewriting the entire document."
+        ),
+    )
+    async def append(
+        ctx: Context,
+        knowledge_base: str,
+        path: str,
+        content: str,
+    ) -> str:
+        handler, err = await _resolve(ctx, knowledge_base)
+        if err:
+            return err
+        return await handler.append(path, content)
